@@ -85,38 +85,38 @@ module.exports = {
 
       // Generate constant for skip parameters.
       // Note: we shouldn't support both way of doing this kind of things in the future.
-      const skip = query.options.start || query.options.skip;
+      const skip = query.options._start || query.options._skip || 0;
+      const limit = _.get(query, 'options._limit', 100); // Take into account the limit if its equal 0
 
       // Extracting ids from original request to map with query results.
-      const ids = this.extractIds(query, ref);
-      
-      if (!_.isArray(ids)) {
-        return data
-          .filter(entry => entry[ids.alias].toString() === ids.value.toString())
-          .slice(skip, skip + query.options.limit);
-      }
+      const ids = this.extractIds(query);
+      const ast = ref.associations.find(ast => ast.alias === ids.alias);
+      const astModel = this.retrieveModel(ast.model || ast.collection, ast.plugin);
 
-      // Critical: don't touch this part until you truly understand what you're doing.
-      // The data array takes care of the sorting of the entries. It explains why we are looping from this array and not the `ids` array.
-      // Then, we're applying the `limit`, `start` and `skip` argument.
       return data
         .filter(entry => entry !== undefined)
-        .filter(entry => ids.map(id => id.toString()).includes(entry[ref.primaryKey].toString()))
-        .slice(skip, skip + query.options.limit);
+        .filter(entry => {
+          const aliasEntry = entry[ids.alias];
+          if (_.isArray(aliasEntry)) {
+            return _.find(
+              aliasEntry,
+              value => value[astModel.primaryKey].toString() ===  ids.value
+            );
+          }
+
+          const entryValue = aliasEntry[astModel.primaryKey].toString();
+          return entryValue === ids.value;
+        })
+        .slice(skip, skip + limit);
     });
   },
 
-  extractIds: (query, ref) => {
-    if ( _.get(query.options, `query.${ref.primaryKey}`)) {
-      return  _.get(query.options, `query.${ref.primaryKey}`);
-    }
-
-    // Single object to retrieve (one-to-many).
+  extractIds: (query) => {
     const alias = _.first(Object.keys(query.options.query));
-
+    const value =  query.options.query[alias].toString();
     return {
       alias,
-      value: _.get(query.options, `query.${alias}`)
+      value,
     };
   },
 
@@ -125,31 +125,24 @@ module.exports = {
       return [];
     }
 
+    // Retrieving referring model.
     const ref = this.retrieveModel(model, query.options.source);
-
-    // Construct parameters object sent to the Content Manager service.
-    // We are faking the `start`, `skip` and `limit` argument because it doesn't make sense because we are merging different requests in one.
-    // Note: we're trying to avoid useless populate for performances. Please be careful if you're updating this part.
-    const populate = ref.associations
-      .filter(association => !association.dominant && _.isEmpty(association.model))
-      .map(association => association.alias);
+    const ast = ref.associations.find(ast => ast.alias === query.alias);
 
     const params = {
       ...query.options,
-      populate,
-      query: query.options.where || {},
-      start: 0,
-      skip: 0,
-      limit: 100,
+      populate: ast ? [query.alias] : [], // Avoid useless population for performance reason
+      query: {},
+      _start: 0, // Don't apply start or skip
+      _skip: 0, // Don't apply start or skip
+      _limit: -1, // Don't apply a limit
     };
 
-    params.query[query.alias] = _.uniq(query.ids.filter(x => !_.isEmpty(x) || _.isInteger(x)).map(x => x.toString()));
-
-    if (['id', '_id'].includes(query.alias)) {
-      // However, we're applying a limit based on the number of entries we've to fetch.
-      // We'll apply the real `skip`, `start` and `limit` parameters during the mapping above.
-      params.limit = params.query[query.alias].length;
-    }
+    params.query[`${query.alias}_in`] = _.chain(query.ids)
+      .filter(id => !_.isEmpty(id) || _.isInteger(id)) // Only keep valid ids
+      .map(id => id.toString()) // convert ids to string
+      .uniq() // Remove redundant ids
+      .value();
 
     // Run query and remove duplicated ID.
     const request = await strapi.plugins['content-manager'].services['contentmanager'].fetchAll({ model }, params);
@@ -186,8 +179,6 @@ module.exports = {
       // Only one entry to fetch.
       if (single) {
         ids.push(params[ref.primaryKey]);
-      } else if (_.isArray(query[ref.primaryKey])) {
-        ids.push(...query[ref.primaryKey]);
       } else {
         ids.push(query[association.via]);
       }
